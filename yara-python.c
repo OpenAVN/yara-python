@@ -15,6 +15,8 @@ limitations under the License.
 */
 /* headers */
 
+#define PY_SSIZE_T_CLEAN
+
 #include <Python.h>
 #include "structmember.h"
 
@@ -44,9 +46,8 @@ typedef long Py_hash_t;
 #endif
 
 #if PY_MAJOR_VERSION >= 3
-#define PY_STRING(x) PyUnicode_FromString(x)
-#define PY_STRING_TO_C(x) PyBytes_AsString(\
-                            PyUnicode_AsEncodedString(x, "utf-8", "strict"))
+#define PY_STRING(x) PyUnicode_DecodeUTF8(x, strlen(x), "ignore" )
+#define PY_STRING_TO_C(x) PyUnicode_AsUTF8(x)
 #define PY_STRING_CHECK(x) PyUnicode_Check(x)
 #else
 #define PY_STRING(x) PyString_FromString(x)
@@ -120,7 +121,7 @@ static PyMemberDef Match_members[] = {
     T_OBJECT_EX,
     offsetof(Match, strings),
     READONLY,
-    "Dictionary with offsets and strings that matched the file"
+    "Tuple with offsets and strings that matched the file"
   },
   { NULL } // End marker
 };
@@ -205,6 +206,8 @@ typedef struct
   PyObject* identifier;
   PyObject* tags;
   PyObject* meta;
+  PyObject* global;
+  PyObject* private;
 } Rule;
 
 static void Rule_dealloc(
@@ -215,6 +218,20 @@ static PyObject* Rule_getattro(
     PyObject* name);
 
 static PyMemberDef Rule_members[] = {
+  {
+    "is_global",
+    T_OBJECT_EX,
+    offsetof(Rule, global),
+    READONLY,
+    "Rule is global"
+  },
+  {
+    "is_private",
+    T_OBJECT_EX,
+    offsetof(Rule, private),
+    READONLY,
+    "Rule is private"
+  },
   {
     "identifier",
     T_OBJECT_EX,
@@ -422,8 +439,8 @@ PyObject* convert_object_to_python(
   switch(object->type)
   {
     case OBJECT_TYPE_INTEGER:
-      if (object->value.i != UNDEFINED)
-        result = Py_BuildValue("i", object->value.i);
+      if (object->value.i != YR_UNDEFINED)
+        result = Py_BuildValue("l", object->value.i);
       break;
 
     case OBJECT_TYPE_STRING:
@@ -507,7 +524,7 @@ PyObject* convert_array_to_python(
   if (array->items == NULL)
     return py_list;
 
-  for (i = 0; i < array->items->count; i++)
+  for (i = 0; i < array->items->length; i++)
   {
     py_object = convert_object_to_python(array->items->objects[i]);
 
@@ -545,7 +562,7 @@ PyObject* convert_dictionary_to_python(
     {
       PyDict_SetItemString(
           py_dict,
-          dictionary->items->objects[i].key,
+          dictionary->items->objects[i].key->c_string,
           py_object);
 
       Py_DECREF(py_object);
@@ -561,6 +578,7 @@ PyObject* convert_dictionary_to_python(
 #define CALLBACK_ALL CALLBACK_MATCHES | CALLBACK_NON_MATCHES
 
 int yara_callback(
+    YR_SCAN_CONTEXT* context,
     int message,
     void* message_data,
     void* user_data)
@@ -595,10 +613,6 @@ int yara_callback(
   int result = CALLBACK_CONTINUE;
 
   if (message == CALLBACK_MSG_SCAN_FINISHED)
-    return CALLBACK_CONTINUE;
-
-  if (message == CALLBACK_MSG_RULE_NOT_MATCHING &&
-      (callback == NULL || (which & CALLBACK_MATCHES)))
     return CALLBACK_CONTINUE;
 
   if (message == CALLBACK_MSG_IMPORT_MODULE && modules_data == NULL)
@@ -727,7 +741,7 @@ int yara_callback(
 
   yr_rule_strings_foreach(rule, string)
   {
-    yr_string_matches_foreach(string, m)
+    yr_string_matches_foreach(context, string, m)
     {
       object = PyBytes_FromStringAndSize((char*) m->data, m->data_length);
 
@@ -994,7 +1008,7 @@ int process_compile_externals(
       result = yr_compiler_define_integer_variable(
           compiler,
           identifier,
-          PyLong_AsLong(value));
+          PyLong_AsLongLong(value));
     }
     else if (PyFloat_Check(value))
     {
@@ -1005,10 +1019,13 @@ int process_compile_externals(
     }
     else if (PY_STRING_CHECK(value))
     {
+      char* str = PY_STRING_TO_C(value);
+
+      if (str == NULL)
+        return ERROR_INVALID_ARGUMENT;
+
       result = yr_compiler_define_string_variable(
-          compiler,
-          identifier,
-          PY_STRING_TO_C(value));
+          compiler, identifier, str);
     }
     else
     {
@@ -1061,7 +1078,7 @@ int process_match_externals(
       result = yr_rules_define_integer_variable(
           rules,
           identifier,
-          PyLong_AsLong(value));
+          PyLong_AsLongLong(value));
     }
     else if (PyFloat_Check(value))
     {
@@ -1072,10 +1089,13 @@ int process_match_externals(
     }
     else if (PY_STRING_CHECK(value))
     {
+      char* str = PY_STRING_TO_C(value);
+
+      if (str == NULL)
+        return ERROR_INVALID_ARGUMENT;
+
       result = yr_rules_define_string_variable(
-          rules,
-          identifier,
-          PY_STRING_TO_C(value));
+          rules, identifier, str);
     }
     else
     {
@@ -1236,6 +1256,8 @@ static void Rule_dealloc(
   Py_XDECREF(object->identifier);
   Py_XDECREF(object->tags);
   Py_XDECREF(object->meta);
+  Py_XDECREF(object->global);
+  Py_XDECREF(object->private);
   PyObject_Del(self);
 }
 
@@ -1322,6 +1344,8 @@ static PyObject* Rules_next(
       Py_DECREF(object);
     }
 
+    rule->global = PyBool_FromLong(rules->iter_current_rule->flags & RULE_FLAGS_GLOBAL);
+    rule->private = PyBool_FromLong(rules->iter_current_rule->flags & RULE_FLAGS_PRIVATE);
     rule->identifier = PY_STRING(rules->iter_current_rule->identifier);
     rule->tags = tag_list;
     rule->meta = meta_list;
@@ -1348,13 +1372,12 @@ static PyObject* Rules_match(
       };
 
   char* filepath = NULL;
-  char* data = NULL;
+  Py_buffer data = {0};
 
   int pid = 0;
   int timeout = 0;
-  int length;
   int error = ERROR_SUCCESS;
-  int fast_mode = FALSE;
+  int fast_mode = 0;
 
   PyObject* externals = NULL;
   PyObject* fast = NULL;
@@ -1372,12 +1395,11 @@ static PyObject* Rules_match(
   if (PyArg_ParseTupleAndKeywords(
         args,
         keywords,
-        "|sis#OOOiOOi",
+        "|sis*OOOiOOi",
         kwlist,
         &filepath,
         &pid,
         &data,
-        &length,
         &externals,
         &callback_data.callback,
         &fast,
@@ -1386,7 +1408,7 @@ static PyObject* Rules_match(
         &callback_data.modules_callback,
         &callback_data.which))
   {
-    if (filepath == NULL && data == NULL && pid == 0)
+    if (filepath == NULL && data.buf == NULL && pid == 0)
     {
       return PyErr_Format(
           PyExc_TypeError,
@@ -1397,6 +1419,7 @@ static PyObject* Rules_match(
     {
       if (!PyCallable_Check(callback_data.callback))
       {
+        PyBuffer_Release(&data);
         return PyErr_Format(
             PyExc_TypeError,
             "'callback' must be callable");
@@ -1407,6 +1430,7 @@ static PyObject* Rules_match(
     {
       if (!PyCallable_Check(callback_data.modules_callback))
       {
+        PyBuffer_Release(&data);
         return PyErr_Format(
             PyExc_TypeError,
             "'modules_callback' must be callable");
@@ -1417,6 +1441,7 @@ static PyObject* Rules_match(
     {
       if (!PyDict_Check(callback_data.modules_data))
       {
+        PyBuffer_Release(&data);
         return PyErr_Format(
             PyExc_TypeError,
             "'modules_data' must be a dictionary");
@@ -1431,11 +1456,14 @@ static PyObject* Rules_match(
         {
           // Restore original externals provided during compiling.
           process_match_externals(object->externals, object->rules);
+
+          PyBuffer_Release(&data);
           return NULL;
         }
       }
       else
       {
+        PyBuffer_Release(&data);
         return PyErr_Format(
             PyExc_TypeError,
             "'externals' must be a dictionary");
@@ -1452,7 +1480,6 @@ static PyObject* Rules_match(
       callback_data.matches = PyList_New(0);
 
       Py_BEGIN_ALLOW_THREADS
-
       error = yr_rules_scan_file(
           object->rules,
           filepath,
@@ -1461,9 +1488,10 @@ static PyObject* Rules_match(
           &callback_data,
           timeout);
 
+
       Py_END_ALLOW_THREADS
     }
-    else if (data != NULL)
+    else if (data.buf != NULL)
     {
       callback_data.matches = PyList_New(0);
 
@@ -1471,8 +1499,8 @@ static PyObject* Rules_match(
 
       error = yr_rules_scan_mem(
           object->rules,
-          (unsigned char*) data,
-          (unsigned int) length,
+          (unsigned char*) data.buf,
+          (size_t) data.len,
           fast_mode ? SCAN_FLAGS_FAST_MODE : 0,
           yara_callback,
           &callback_data,
@@ -1497,6 +1525,8 @@ static PyObject* Rules_match(
       Py_END_ALLOW_THREADS
     }
 
+    PyBuffer_Release(&data);
+
     // Restore original externals provided during compiling.
     if (object->externals != NULL)
     {
@@ -1514,7 +1544,18 @@ static PyObject* Rules_match(
 
       if (error != ERROR_CALLBACK_ERROR)
       {
-        handle_error(error, filepath);
+        if (filepath != NULL)
+        {
+          handle_error(error, filepath);
+        }
+        else if (pid != 0)
+        {
+          handle_error(error, "<proc>");
+        }
+        else
+        {
+          handle_error(error, "<data>");
+        }
 
         #ifdef PROFILING_ENABLED
         PyObject* exception = PyErr_Occurred();
@@ -1650,6 +1691,7 @@ void raise_exception_on_error(
     int error_level,
     const char* file_name,
     int line_number,
+    const YR_RULE* rule,
     const char* message,
     void* user_data)
 {
@@ -1676,6 +1718,7 @@ void raise_exception_on_error_or_warning(
     int error_level,
     const char* file_name,
     int line_number,
+    const YR_RULE* rule,
     const char* message,
     void* user_data)
 {
@@ -1812,6 +1855,68 @@ void yara_include_free(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+static PyObject* yara_set_config(
+    PyObject* self,
+    PyObject* args,
+    PyObject* keywords)
+{
+
+  /*
+   * It is recommended that this be kept up to date with the config
+   * options present in yara/libyara.c yr_set_configuration(...) - ck
+   */
+  static char *kwlist[] = {
+    "stack_size", "max_strings_per_rule", "max_match_data", NULL};
+
+  unsigned int stack_size = 0;
+  unsigned int max_strings_per_rule = 0;
+  unsigned int max_match_data = 0;
+
+  int error = 0;
+
+  if (PyArg_ParseTupleAndKeywords(
+        args,
+        keywords,
+        "|III",
+        kwlist,
+        &stack_size,
+        &max_strings_per_rule,
+  	&max_match_data))
+  {
+    if (stack_size != 0)
+    {
+      error = yr_set_configuration(
+          YR_CONFIG_STACK_SIZE,
+          &stack_size);
+
+      if ( error != ERROR_SUCCESS)
+        return handle_error(error, NULL);
+    }
+
+    if (max_strings_per_rule != 0)
+    {
+      error = yr_set_configuration(
+          YR_CONFIG_MAX_STRINGS_PER_RULE,
+				  &max_strings_per_rule);
+
+      if (error != ERROR_SUCCESS)
+        return handle_error(error, NULL);
+    }
+
+    if (max_match_data != 0)
+    {
+      error = yr_set_configuration(
+          YR_CONFIG_MAX_MATCH_DATA,
+				  &max_match_data);
+
+      if (error != ERROR_SUCCESS)
+        return handle_error(error, NULL);
+    }
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyObject* yara_compile(
     PyObject* self,
     PyObject* args,
@@ -1896,7 +2001,7 @@ static PyObject* yara_compile(
       if (PyBool_Check(includes))
       {
         // PyObject_IsTrue can return -1 in case of error
-        if (PyObject_IsTrue(includes) == 1)
+        if (PyObject_IsTrue(includes) == 0)
           yr_compiler_set_include_callback(compiler, NULL, NULL, NULL);
       }
       else
@@ -2241,6 +2346,12 @@ static PyMethodDef yara_methods[] = {
     METH_VARARGS | METH_KEYWORDS,
     "Loads a previously saved YARA rules file and returns an instance of class Rules"
   },
+  {
+    "set_config",
+    (PyCFunction) yara_set_config,
+    METH_VARARGS | METH_KEYWORDS,
+    "Set a yara configuration variable (stack_size, max_strings_per_rule, or max_match_data)"
+  },
   { NULL, NULL }
 };
 
@@ -2301,6 +2412,10 @@ MOD_INIT(yara)
 
   if (PyType_Ready(&Match_Type) < 0)
     return MOD_ERROR_VAL;
+
+  PyModule_AddObject(m, "Rule", (PyObject*) &Rule_Type);
+  PyModule_AddObject(m, "Rules", (PyObject*) &Rules_Type);
+  PyModule_AddObject(m, "Match",  (PyObject*) &Match_Type);
 
   PyModule_AddObject(m, "Error", YaraError);
   PyModule_AddObject(m, "SyntaxError", YaraSyntaxError);

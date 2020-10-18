@@ -30,12 +30,13 @@ import tempfile
 import shutil
 import subprocess
 
-
 OPTIONS = [
    ('dynamic-linking', None, 'link dynamically against libyara'),
    ('enable-cuckoo', None, 'enable "cuckoo" module'),
    ('enable-magic', None, 'enable "magic" module'),
    ('enable-dotnet', None, 'enable "dotnet" module'),
+   ('enable-dex', None, 'enable "dex" module'),
+   ('enable-macho', None, 'enable "macho" module'),
    ('enable-profiling', None, 'enable profiling features')]
 
 
@@ -44,6 +45,8 @@ BOOLEAN_OPTIONS = [
     'enable-cuckoo',
     'enable-magic',
     'enable-dotnet',
+    'enable-dex',
+    'enable-macho',
     'enable-profiling']
 
 
@@ -96,6 +99,8 @@ class BuildCommand(build):
     self.enable_magic = None
     self.enable_cuckoo = None
     self.enable_dotnet = None
+    self.enable_dex = None
+    self.enable_macho = None
     self.enable_profiling = None
 
   def finalize_options(self):
@@ -116,6 +121,8 @@ class BuildExtCommand(build_ext):
     self.enable_magic = None
     self.enable_cuckoo = None
     self.enable_dotnet = None
+    self.enable_dex = None
+    self.enable_macho = None
     self.enable_profiling = None
 
   def finalize_options(self):
@@ -130,6 +137,8 @@ class BuildExtCommand(build_ext):
         ('enable_magic', 'enable_magic'),
         ('enable_cuckoo', 'enable_cuckoo'),
         ('enable_dotnet', 'enable_dotnet'),
+        ('enable_dex', 'enable_dex'),
+        ('enable_macho', 'enable_macho'),
         ('enable_profiling', 'enable_profiling'))
 
     if self.enable_magic and self.dynamic_linking:
@@ -141,6 +150,12 @@ class BuildExtCommand(build_ext):
     if self.enable_dotnet and self.dynamic_linking:
       raise distutils.errors.DistutilsOptionError(
           '--enable-dotnet can''t be used with --dynamic-linking')
+    if self.enable_dex and self.dynamic_linking:
+      raise distutils.errors.DistutilsOptionError(
+          '--enable-dex can''t be used with --dynamic-linking')
+    if self.enable_macho and self.dynamic_linking:
+      raise distutils.errors.DistutilsOptionError(
+          '--enable-macho can''t be used with --dynamic-linking')
 
   def run(self):
     """Execute the build command."""
@@ -162,11 +177,14 @@ class BuildExtCommand(build_ext):
     building_for_windows = self.plat_name in ('win32','win-amd64')
     building_for_osx = 'macosx' in self.plat_name
     building_for_linux = 'linux' in self.plat_name
+    building_for_freebsd = 'freebsd' in self.plat_name
+    building_for_openbsd = 'openbsd' in self.plat_name # need testing
 
     if building_for_linux:
+      module.define_macros.append(('_GNU_SOURCE', '1'))
       module.define_macros.append(('USE_LINUX_PROC', '1'))
-
-    if building_for_windows:
+      module.extra_compile_args.append('-std=c99')
+    elif building_for_windows:
       module.define_macros.append(('USE_WINDOWS_PROC', '1'))
       module.define_macros.append(('_CRT_SECURE_NO_WARNINGS', '1'))
       module.libraries.append('kernel32')
@@ -174,14 +192,34 @@ class BuildExtCommand(build_ext):
       module.libraries.append('user32')
       module.libraries.append('crypt32')
       module.libraries.append('ws2_32')
-
-    if building_for_osx:
+    elif building_for_osx:
+      module.define_macros.append(('_GNU_SOURCE', '1'))
       module.define_macros.append(('USE_MACH_PROC', '1'))
+      module.extra_compile_args.append('-std=c99')
       module.include_dirs.append('/usr/local/opt/openssl/include')
       module.include_dirs.append('/opt/local/include')
       module.library_dirs.append('/opt/local/lib')
       module.include_dirs.append('/usr/local/include')
       module.library_dirs.append('/usr/local/lib')
+    elif building_for_freebsd:
+      module.define_macros.append(('_GNU_SOURCE', '1'))
+      module.define_macros.append(('USE_FREEBSD_PROC', '1'))
+      module.include_dirs.append('/opt/local/include')
+      module.library_dirs.append('/opt/local/lib')
+      module.include_dirs.append('/usr/local/include')
+      module.library_dirs.append('/usr/local/lib')
+    elif building_for_openbsd:
+      module.define_macros.append(('_GNU_SOURCE', '1'))
+      module.define_macros.append(('USE_OPENBSD_PROC', '1'))
+      module.extra_compile_args.append('-std=c99')
+      module.include_dirs.append('/opt/local/include')
+      module.library_dirs.append('/opt/local/lib')
+      module.include_dirs.append('/usr/local/include')
+      module.library_dirs.append('/usr/local/lib')
+    else:
+      module.define_macros.append(('_GNU_SOURCE', '1'))
+      module.define_macros.append(('USE_NO_PROC', '1'))
+      module.extra_compile_args.append('-std=c99')
 
     if has_function('memmem'):
       module.define_macros.append(('HAVE_MEMMEM', '1'))
@@ -191,7 +229,7 @@ class BuildExtCommand(build_ext):
       module.define_macros.append(('HAVE_STRLCAT', '1'))
 
     if self.enable_profiling:
-      module.define_macros.append(('PROFILING_ENABLED', '1'))
+      module.define_macros.append(('YR_PROFILING_ENABLED', '1'))
 
     if self.dynamic_linking:
       module.libraries.append('yara')
@@ -203,24 +241,38 @@ class BuildExtCommand(build_ext):
           module.define_macros.append(('HAVE_LIBCRYPTO', '1'))
           module.libraries.append('crypto')
         else:
-          exclusions.append('yara/libyara/modules/hash.c')
+          exclusions.append('yara/libyara/modules/hash/hash.c')
 
       if self.enable_magic:
         module.define_macros.append(('MAGIC_MODULE', '1'))
         module.libraries.append('magic')
       else:
-        exclusions.append('yara/libyara/modules/magic.c')
+        exclusions.append('yara/libyara/modules/magic/magic.c')
 
       if self.enable_cuckoo:
         module.define_macros.append(('CUCKOO_MODULE', '1'))
         module.libraries.append('jansson')
       else:
-        exclusions.append('yara/libyara/modules/cuckoo.c')
+        exclusions.append('yara/libyara/modules/cuckoo/cuckoo.c')
 
       if self.enable_dotnet:
         module.define_macros.append(('DOTNET_MODULE', '1'))
       else:
-        exclusions.append('yara/libyara/modules/dotnet.c')
+        exclusions.append('yara/libyara/modules/dotnet/dotnet.c')
+
+      if self.enable_dex:
+        module.define_macros.append(('DEX_MODULE', '1'))
+      else:
+        exclusions.append('yara/libyara/modules/dex/dex.c')
+
+      if self.enable_macho:
+        module.define_macros.append(('MACHO_MODULE', '1'))
+      else:
+        exclusions.append('yara/libyara/modules/macho/macho.c')
+
+      # exclude pb_tests module
+      exclusions.append('yara/libyara/modules/pb_tests/pb_tests.c')
+      exclusions.append('yara/libyara/modules/pb_tests/pb_tests.pb-c.c')
 
       exclusions = [os.path.normpath(x) for x in exclusions]
 
@@ -271,13 +323,19 @@ with open('README.rst', 'r', 'utf-8') as f:
 
 setup(
     name='yara-python',
-    version='3.7.0',
+    version='4.0.2',
     description='Python interface for YARA',
     long_description=readme,
     license='Apache 2.0',
     author='Victor M. Alvarez',
-    author_email='plusvic@gmail.com;vmalvarez@virustotal.com',
+    author_email='plusvic@gmail.com, vmalvarez@virustotal.com',
     url='https://github.com/VirusTotal/yara-python',
+    classifiers=[
+        'Programming Language :: Python',
+        'License :: OSI Approved :: Apache Software License',
+        'Operating System :: OS Independent',
+        'Development Status :: 5 - Production/Stable',
+    ],
     zip_safe=False,
     cmdclass={
         'build': BuildCommand,
